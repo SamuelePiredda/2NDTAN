@@ -1,0 +1,8 @@
+1. Creare la classe orbit nel miglior modo possibile dato che sarà il cuore del programma
+
+	- Usare fin da subito le unita di misura di astropy
+
+    - Poliastro per la propagazione orbitale
+    - SkyField per sapere dov'è il sole, la terra e il resto nel frame orbitale
+    - Deve poter funzionare per tutte le tipologie di orbite
+    - Il coefficiente se siamo in eclissi oppure no deve essere implementato
