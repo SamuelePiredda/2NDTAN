@@ -46,7 +46,7 @@ class Node:
             dv = np.cross(omega, self.Normal)*dt
             v_new = self.Normal + dv
             v_new = v_new*(np.linalg.norm(self.Normal)/np.linalg.norm(v_new))
-            self.Normal = v_new/np.linalg.norm(v_new)            
+            self.Normal = v_new/np.linalg.norm(v_new) 
         return
 
 
@@ -82,6 +82,7 @@ class Node:
         self.EarthAngle = 0.0
 
         self.Internal = False
+
 
 
     def updateTemp(self, temp):

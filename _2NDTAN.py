@@ -3,6 +3,7 @@ from _2ND_Nodes import Node
 
 import math
 import os
+import random
 import numpy as np
 import pandas as pd 
 from astropy import units as u
@@ -87,13 +88,13 @@ def set_Rotational_Vector(attitude, custom, random_coeff, orb):
 
 
 
-def set_Nodes_Nadir(Nodes):
+def set_Nodes_Nadir(Nodes, attitude, orb, epoch):
     for nod in Nodes:
-        nod.Normal = nod.Normal_Nadir
+        nod.Normal = setup_norm_vector(nod.Normal_Nadir, attitude, orb, epoch)
 
-def set_Nodes_Sun(Nodes):
+def set_Nodes_Sun(Nodes, attitude, orb, epoch):
     for nod in Nodes:
-        nod.Normal = nod.Normal_Sun
+        nod.Normal = setup_norm_vector(nod.Normal_Sun, attitude, orb, epoch)
 
 
 def setup_norm_vector(text, attitude, orb, epoch):
@@ -169,9 +170,6 @@ def selectFile():
 
 
 def main():
-
-
-
 
 
 
@@ -328,8 +326,8 @@ def main():
         if FILE_H.loc[i].iat[11] == 1:
             BATTERY_NODE = i
 
-        nod.Normal_Nadir = FILE_H.loc[i].iat[8]
-        nod.Normal_Sun = FILE_H.loc[i].iat[7]
+        nod.Normal_Nadir = str(FILE_H.loc[i].iat[8])
+        nod.Normal_Sun = str(FILE_H.loc[i].iat[7])
 
         Nodes.append(nod)
 
@@ -578,16 +576,15 @@ def main():
     for nod in Nodes:
         if nod.Normal_Nadir.upper() == "I" and nod.Normal_Sun.upper() == "I":
             nod.Internal = True
-        nod.Normal_Nadir = setup_norm_vector(nod.Normal_Nadir, "N", Orb.Orbit, Orb.Epoch)
-        nod.Normal_Sun = setup_norm_vector(nod.Normal_Sun, "S", Orb.Orbit, Orb.Epoch)
 
         if nod.Internal == True:
             nod.Normal = 0
         else:
             if SIM_ATTITUDE == "N":
-                nod.Normal = nod.Normal_Nadir
+                nod.Normal = setup_norm_vector(nod.Normal_Nadir, "N", Orb.Orbit, Orb.Epoch)
             else:
-                nod.Normal = nod.Normal_Sun
+                nod.Normal = setup_norm_vector(nod.Normal_Sun, "S", Orb.Orbit, Orb.Epoch)
+
 
 
     # READING THIRD SHEET WITH EPS SIMULATION PARAMETERS
@@ -849,9 +846,9 @@ def main():
     SIM_TIME = 0
 
     if SIM_ATTITUDE == "N":
-        set_Nodes_Nadir(Nodes)
+        set_Nodes_Nadir(Nodes, SIM_ATTITUDE, Orb.Orbit, SIM_START_EPOCH)
     else:
-        set_Nodes_Sun(Nodes)
+        set_Nodes_Sun(Nodes, SIM_ATTITUDE, Orb.Orbit, SIM_START_EPOCH)
 
     SIM_ECLIPSE = 0
 
@@ -868,6 +865,7 @@ def main():
         current_time = SIM_START_EPOCH + step*SIM_STEP_SIZE*u.s
         dt = current_time - Orb.Orbit.epoch
         current_orbit = Orb.Orbit.propagate(dt)
+
 
         for nod in Nodes:
             nod.rotate_Normal(SIM_ROTATION_VECTOR, SIM_STEP_SIZE)
