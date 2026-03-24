@@ -8,29 +8,29 @@ from poliastro.twobody import Orbit
 
 class _2ND_Orbit:
 
-    Rearth = 0
-    Fsun = 0
-    Fearth = 0
-    albedo = 0.3
+    def __init__(self):
+        self.Rearth = 0
+        self.Fsun = 0
+        self.Fearth = 0
+        self.albedo = 0.3
+        self.EclipseHistory = []
+        self.Eclipse = 0
 
-
-    EclipseHistory = []
-
-    # must be updated during orbit propagation
-    Epoch = ""
-    alt = 0
-    ecc = 0
-    INC = 0
-    LTAN = 0
-    RAAN = 0
-    AOP = 0
-    TA = 0
+        # must be updated during orbit propagation
+        self.Epoch = ""
+        self.alt = 0
+        self.ecc = 0
+        self.INC = 0
+        self.LTAN = None
+        self.RAAN = 0
+        self.AOP = 0
+        self.TA = 0
 
     @staticmethod
     def RTH_to_GCRS_Matrix(orb):
-        r_dot = orb.r.value/np.linalg.norm(orb.Orbit.r.value)
+        r_dot = orb.r.value/np.linalg.norm(orb.r.value)
 
-        h_dot = orb.h_vec.value/np.linalg.norm(orb.Orbit.h.value)
+        h_dot = orb.h_vec.value/np.linalg.norm(orb.h_vec.value)
 
         v_dot = np.cross(h_dot, r_dot)
         v_dot = v_dot/np.linalg.norm(v_dot)
@@ -60,7 +60,7 @@ class _2ND_Orbit:
         return v
 
     @staticmethod
-    def XYZ_to_GCRS(vector, epoch):
+    def SUNXYZ_to_GCRS(vector, epoch):
 
         S = get_sun(epoch).cartesian.xyz.value
 
@@ -77,6 +77,15 @@ class _2ND_Orbit:
         M_GCRS_to_XYZ = np.vstack((X_dot, Y_dot, Z_dot))
         M_XYZ_to_GCRS = M_GCRS_to_XYZ.T
         return M_XYZ_to_GCRS @ vector
+
+    @staticmethod
+    def INERTIALXYZ_to_GCRS(vector):
+        return np.array(vector, dtype=float)
+
+    @staticmethod
+    def get_nadir_rotation_vector(orb):
+        r_norm = np.linalg.norm(orb.r.value)
+        return orb.h_vec.value/(r_norm*r_norm)
 
 
 
@@ -132,25 +141,29 @@ class _2ND_Orbit:
 
         if separation >= (angle_earth + angle_sun):
             self.EclipseHistory.append(1.0)
+            self.Eclipse = 1.0
             return 1.0  
         elif separation <= (angle_earth - angle_sun):
             self.EclipseHistory.append(0.0)
+            self.Eclipse = 0.0
             return 0.0  
         else:
             self.EclipseHistory.append((separation - (angle_earth - angle_sun)) / (2 * angle_sun))
+            self.Eclipse = (separation - (angle_earth - angle_sun)) / (2 * angle_sun)
             return (separation - (angle_earth - angle_sun)) / (2 * angle_sun)
 
 
 
     def create_orbit(self):
 
-        if self.LTAN != 0:
-            self.RAAN = self.ltan_to_raan(self.LTAN, self.Epoch).value
+        if self.LTAN is not None:
+            self.RAAN = self.ltan_to_raan(self.LTAN, self.Epoch).to(u.rad).value
 
+        # The input altitude is defined as the pericenter altitude above Earth.
         self.Orbit = Orbit.from_classical(Earth, (self.alt+self.Rearth)/(1-self.ecc)*u.km, self.ecc*u.one, self.INC*u.rad, self.RAAN*u.rad, self.AOP*u.rad, self.TA*u.rad, self.Epoch)
 
 
 
-    def propagate_orbit(self, Time):
+    def propagate_orbit(self, delta_t):
 
-        self.Orbit = self.Orbit.propagate(Time)
+        self.Orbit = self.Orbit.propagate(delta_t)
