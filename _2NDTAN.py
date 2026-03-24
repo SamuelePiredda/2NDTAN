@@ -6,6 +6,7 @@ from scipy.optimize import fsolve
 import math
 import os
 import random
+import time as pytime
 import warnings
 import numpy as np
 import pandas as pd 
@@ -66,6 +67,17 @@ def DEBUG_printNodes(node_array):
         print(f"    History  : [{history_len} data points recorded]")
         
     print("\n=== End of Debug Info ===")
+
+
+def format_duration(seconds):
+    seconds = max(0, int(round(seconds)))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def _positive_cos_deg(angle_deg):
@@ -492,7 +504,57 @@ def _shade_eclipse_regions(ax, time_array, eclipse_history):
         ax.axvspan(eclipse_start, time_array[-1], color="0.85", alpha=0.5, zorder=0)
 
 
-def plot_temperature_groups(Nodes, time_array, eclipse_history, temp_min_k, temp_max_k):
+def _shade_transition_regions(ax, time_array, attitude_history):
+    transition_start = None
+    added_label = False
+
+    for i, attitude_value in enumerate(attitude_history):
+        in_transition = attitude_value == "TRANSITION"
+
+        if in_transition and transition_start is None:
+            transition_start = time_array[i]
+        elif not in_transition and transition_start is not None:
+            transition_end = time_array[i]
+            ax.axvspan(
+                transition_start,
+                transition_end,
+                color="#f6c453",
+                alpha=0.25,
+                zorder=0.1,
+                label="Transition" if not added_label else None,
+            )
+            transition_start = None
+            added_label = True
+
+    if transition_start is not None and len(time_array) > 0:
+        ax.axvspan(
+            transition_start,
+            time_array[-1],
+            color="#f6c453",
+            alpha=0.25,
+            zorder=0.1,
+            label="Transition" if not added_label else None,
+        )
+
+
+def _label_horizontal_line(ax, y_value, text, color):
+    x_min, x_max = ax.get_xlim()
+    x_text = x_max - 0.02 * (x_max - x_min if x_max != x_min else 1.0)
+    ax.annotate(
+        text,
+        xy=(x_text, y_value),
+        xytext=(0, 4),
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        color=color,
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="none", alpha=0.8),
+        clip_on=False,
+    )
+
+
+def plot_temperature_groups(Nodes, time_array, eclipse_history, attitude_history, temp_min_k, temp_max_k):
     groups = sorted({nod.PlotGroup for nod in Nodes})
     temp_min_c = temp_min_k - 273.15
     temp_max_c = temp_max_k - 273.15
@@ -505,6 +567,7 @@ def plot_temperature_groups(Nodes, time_array, eclipse_history, temp_min_k, temp
                 ax.plot(time_array, np.array(nod.TempHistory) - 273.15, label=nod.Name)
 
         _shade_eclipse_regions(ax, time_array, eclipse_history)
+        _shade_transition_regions(ax, time_array, attitude_history)
         ax.axhline(temp_max_c, color="red", linestyle="--", linewidth=1.2, label="TempMax")
         ax.axhline(temp_min_c, color="blue", linestyle="--", linewidth=1.2, label="TempMin")
 
@@ -512,40 +575,49 @@ def plot_temperature_groups(Nodes, time_array, eclipse_history, temp_min_k, temp
         ax.set_xlabel("Orbit")
         ax.set_ylabel("Temperature [C]")
         ax.grid(True)
-        ax.legend(loc="upper right")
+        ax.margins(y=0.05)
+        _label_horizontal_line(ax, temp_max_c, f"TempMax = {temp_max_c:.1f} C", "red")
+        _label_horizontal_line(ax, temp_min_c, f"TempMin = {temp_min_c:.1f} C", "blue")
+        ax.legend(loc="lower right")
 
 
-def plot_power_history(time_array, eclipse_history, power_state):
+def plot_power_history(time_array, eclipse_history, attitude_history, power_state):
     if power_state is None or not power_state["enabled"]:
         return
     if len(power_state["battery_history"]) != len(time_array):
         return
 
-    fig, (ax_energy, ax_power) = plt.subplots(2, 1, sharex=True)
     battery_history = np.array(power_state["battery_history"], dtype=float)
     battery_max_cap = power_state["battery_max_cap"]
 
+    fig_energy, ax_energy = plt.subplots()
     _shade_eclipse_regions(ax_energy, time_array, eclipse_history)
+    _shade_transition_regions(ax_energy, time_array, attitude_history)
     ax_energy.plot(time_array, battery_history, label="Battery Energy", color="tab:green")
     ax_energy.axhline(battery_max_cap, color="tab:red", linestyle="--", linewidth=1.2, label="Battery Max")
-    ax_energy.set_title("Power Simulation")
+    ax_energy.set_title("Battery Energy")
+    ax_energy.set_xlabel("Orbit")
     ax_energy.set_ylabel("Energy [Wh]")
     ax_energy.set_ylim(0.0, battery_max_cap + 5.0)
     ax_energy.grid(True)
-    ax_energy.legend(loc="upper right")
+    _label_horizontal_line(ax_energy, battery_max_cap, f"Battery Max = {battery_max_cap:.1f} Wh", "tab:red")
+    ax_energy.legend(loc="lower right")
 
+    fig_power, ax_power = plt.subplots()
     _shade_eclipse_regions(ax_power, time_array, eclipse_history)
+    _shade_transition_regions(ax_power, time_array, attitude_history)
     ax_power.plot(time_array, power_state["solar_bus_power_history"], label="Solar Bus Power", color="tab:orange")
     ax_power.plot(time_array, power_state["load_power_history"], label="Load Power", color="tab:blue")
     ax_power.plot(time_array, power_state["heater_power_history"], label="Heater Power", color="tab:red")
     ax_power.plot(time_array, power_state["battery_loss_power_history"], label="Battery Loss Heat", color="tab:purple")
+    ax_power.set_title("Power Flows")
     ax_power.set_xlabel("Orbit")
     ax_power.set_ylabel("Power [W]")
     ax_power.grid(True)
-    ax_power.legend(loc="upper right")
+    ax_power.legend(loc="lower right")
 
 
-def plot_battery_soc_history(time_array, eclipse_history, power_state):
+def plot_battery_soc_history(time_array, eclipse_history, attitude_history, power_state):
     if power_state is None or not power_state["enabled"]:
         return
     if len(power_state["battery_history"]) != len(time_array):
@@ -560,22 +632,25 @@ def plot_battery_soc_history(time_array, eclipse_history, power_state):
 
     fig, ax = plt.subplots()
     _shade_eclipse_regions(ax, time_array, eclipse_history)
-    ax.plot(time_array, soc_history, label="State of Charge", color="tab:cyan")
+    _shade_transition_regions(ax, time_array, attitude_history)
+    ax.plot(time_array, soc_history, label="State of Charge", color="tab:cyan", linewidth=1.8, zorder=2.0)
     ax.set_title("Battery State of Charge")
     ax.set_xlabel("Orbit")
     ax.set_ylabel("State of Charge [%]")
-    ax.set_ylim(0.0, 100.0)
+    soc_upper = 100.5 if np.allclose(soc_history, 100.0, atol=1e-6, equal_nan=False) else 100.0
+    ax.set_ylim(0.0, soc_upper)
     ax.grid(True)
-    ax.legend(loc="upper right")
+    ax.legend(loc="lower right")
 
 
-def plot_node_generated_power(Nodes, time_array, eclipse_history):
+def plot_node_generated_power(Nodes, time_array, eclipse_history, attitude_history):
     nodes_with_cells = [nod for nod in Nodes if nod.NumCells > 0]
     if len(nodes_with_cells) == 0:
         return
 
     fig, ax = plt.subplots()
     _shade_eclipse_regions(ax, time_array, eclipse_history)
+    _shade_transition_regions(ax, time_array, attitude_history)
 
     for nod in nodes_with_cells:
         if len(nod.PowerGeneratedHistory) == len(time_array):
@@ -585,7 +660,7 @@ def plot_node_generated_power(Nodes, time_array, eclipse_history):
     ax.set_xlabel("Orbit")
     ax.set_ylabel("Power [W]")
     ax.grid(True)
-    ax.legend(loc="upper right")
+    ax.legend(loc="lower right")
 
 
 def _series_to_length(values, target_len):
@@ -847,6 +922,67 @@ def apply_power_mission_to_nodes(Nodes, node_power_state):
             nod.Qint = node_power_state[nod.Name]
 
 
+def get_target_normals_for_attitude(Nodes, attitude, orb, epoch, fixed_vector=None):
+    target_normals = []
+
+    for nod in Nodes:
+        if nod.Internal:
+            target_normals.append(0)
+        elif attitude == "N":
+            target_normals.append(setup_norm_vector(nod.Normal_Nadir, "N", orb, epoch))
+        elif attitude == "S":
+            target_normals.append(setup_norm_vector(nod.Normal_Sun, "S", orb, epoch))
+        elif attitude == "F":
+            target_normals.append(setup_norm_vector(nod.Normal_Sun, "F", orb, epoch, fixed_vector))
+        else:
+            target_normals.append(np.array(nod.Normal, dtype=float))
+
+    return target_normals
+
+
+def slerp_vectors(v0, v1, fraction):
+    v0 = np.array(v0, dtype=float)
+    v1 = np.array(v1, dtype=float)
+    v0 = v0 / np.linalg.norm(v0)
+    v1 = v1 / np.linalg.norm(v1)
+
+    dot_value = np.clip(np.dot(v0, v1), -1.0, 1.0)
+
+    if dot_value > 0.9995:
+        blended = v0 + fraction * (v1 - v0)
+        return blended / np.linalg.norm(blended)
+
+    if dot_value < -0.9995:
+        reference = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(v0, reference)) > 0.9:
+            reference = np.array([0.0, 1.0, 0.0])
+        axis = np.cross(v0, reference)
+        axis = axis / np.linalg.norm(axis)
+        angle = np.pi * fraction
+        rotated = (
+            v0 * np.cos(angle)
+            + np.cross(axis, v0) * np.sin(angle)
+            + axis * np.dot(axis, v0) * (1.0 - np.cos(angle))
+        )
+        return rotated / np.linalg.norm(rotated)
+
+    theta = np.arccos(dot_value)
+    sin_theta = np.sin(theta)
+    coeff_0 = np.sin((1.0 - fraction) * theta) / sin_theta
+    coeff_1 = np.sin(fraction * theta) / sin_theta
+    blended = coeff_0 * v0 + coeff_1 * v1
+    return blended / np.linalg.norm(blended)
+
+
+def apply_attitude_transition(Nodes, start_normals, target_normals, fraction):
+    fraction = float(np.clip(fraction, 0.0, 1.0))
+
+    for i, nod in enumerate(Nodes):
+        if nod.Internal:
+            continue
+        nod.Normal = slerp_vectors(start_normals[i], target_normals[i], fraction)
+
+
 def fixed_xyz_to_gcrs(vector, fixed_direction):
     x_dot = np.array(fixed_direction, dtype=float)
     x_dot = x_dot / np.linalg.norm(x_dot)
@@ -1063,7 +1199,7 @@ def main():
 
 
     SIM_VERSION = "1.0"
-    SIM_MAX_PARAM = 29
+    SIM_MAX_PARAM = 30
     SIM_EPS_MAX_PARAM = 13
     FILE_PATH = ""
     FILE_H = ""
@@ -1092,6 +1228,7 @@ def main():
     SIM_R_DOT_CUSTOM = 0.0
     SIM_T_DOT_CUSTOM = 0.0
     SIM_H_DOT_CUSTOM = 0.0
+    SIM_ATTITUDE_CHANGE_TIME = 0.0
 
 
     SIM_PWR_SC_AREA = 0.0
@@ -1485,6 +1622,12 @@ def main():
         print("ERROR: The Node name that must point to a fixed point is not present as a node " + str(SIM_NODE_POINTING))
         exit(1)
 
+    SIM_ATTITUDE_CHANGE_TIME = float(FILE_H.iloc[index].iat[1])
+    index = index + 1
+    if SIM_ATTITUDE_CHANGE_TIME < 0 and DATA_PROTECTION:
+        print("ERROR: The attitude change time must be positive [ROW "+str(index)+"]")
+        exit(1)
+
 
     
     Orb.create_orbit()
@@ -1834,6 +1977,7 @@ def main():
         print("Battery node present: NO")
     else:
         print("Battery node present: YES (" + Nodes[BATTERY_NODE].Name + ")")
+    SIM_WALL_START = pytime.time()
 
 
 
@@ -1848,24 +1992,30 @@ def main():
     ATTITUDE_HISTORY = []
 
     initial_orbit = Orb.Orbit
-    CURRENT_ATTITUDE, CURRENT_FIXED_VECTOR = get_mission_attitude_state(
+    DESIRED_ATTITUDE, DESIRED_FIXED_VECTOR = get_mission_attitude_state(
         0.0,
         SIM_ATTITUDE,
         VEC_FIXED,
         ATTITUDE_MISSION,
     )
-    PREVIOUS_ATTITUDE = CURRENT_ATTITUDE
+    APPLIED_ATTITUDE = DESIRED_ATTITUDE
+    APPLIED_FIXED_VECTOR = DESIRED_FIXED_VECTOR
+    PREVIOUS_ATTITUDE = DESIRED_ATTITUDE
+    ATTITUDE_TRANSITION_ACTIVE = False
+    ATTITUDE_TRANSITION_START_TIME = 0.0
+    ATTITUDE_TRANSITION_START_NORMALS = []
+    ATTITUDE_TRANSITION_TARGET_NORMALS = []
 
-    if CURRENT_ATTITUDE == "N":
-        set_Nodes_Nadir(Nodes, CURRENT_ATTITUDE, Orb.Orbit, SIM_START_EPOCH)
-    elif CURRENT_ATTITUDE == "F":
-        set_Nodes_Sun(Nodes, CURRENT_ATTITUDE, Orb.Orbit, SIM_START_EPOCH, CURRENT_FIXED_VECTOR)
+    if APPLIED_ATTITUDE == "N":
+        set_Nodes_Nadir(Nodes, APPLIED_ATTITUDE, Orb.Orbit, SIM_START_EPOCH)
+    elif APPLIED_ATTITUDE == "F":
+        set_Nodes_Sun(Nodes, APPLIED_ATTITUDE, Orb.Orbit, SIM_START_EPOCH, APPLIED_FIXED_VECTOR)
     else:
         set_Nodes_Sun(Nodes, "S", Orb.Orbit, SIM_START_EPOCH)
 
-    if CURRENT_ATTITUDE in ["R", "C"]:
-        SIM_ROTATION_VECTOR = set_Rotational_Vector(CURRENT_ATTITUDE, SIM_DOT_CUSTOM, SIM_RAND_COEFF, Orb.Orbit)
-        print_attitude_rotation_info(CURRENT_ATTITUDE, SIM_ROTATION_VECTOR, SIM_DOT_CUSTOM)
+    if APPLIED_ATTITUDE in ["R", "C"]:
+        SIM_ROTATION_VECTOR = set_Rotational_Vector(APPLIED_ATTITUDE, SIM_DOT_CUSTOM, SIM_RAND_COEFF, Orb.Orbit)
+        print_attitude_rotation_info(APPLIED_ATTITUDE, SIM_ROTATION_VECTOR, SIM_DOT_CUSTOM)
 
     SIM_ECLIPSE = 0
 
@@ -1881,13 +2031,12 @@ def main():
         TIME_ARRAY.append(SIM_TIME)
         CURRENT_ORBIT_UNIT = SIM_TIME / ORBIT_PERIOD_S
         ORBIT_ARRAY.append(CURRENT_ORBIT_UNIT)
-        CURRENT_ATTITUDE, CURRENT_FIXED_VECTOR = get_mission_attitude_state(
+        DESIRED_ATTITUDE, DESIRED_FIXED_VECTOR = get_mission_attitude_state(
             CURRENT_ORBIT_UNIT,
             SIM_ATTITUDE,
             VEC_FIXED,
             ATTITUDE_MISSION,
         )
-        ATTITUDE_HISTORY.append(CURRENT_ATTITUDE)
         CURRENT_NODE_POWER = get_mission_power_state(
             CURRENT_ORBIT_UNIT,
             DEFAULT_NODE_POWER,
@@ -1895,33 +2044,98 @@ def main():
         )
         apply_power_mission_to_nodes(Nodes, CURRENT_NODE_POWER)
 
-        if CURRENT_ATTITUDE != PREVIOUS_ATTITUDE:
-            if CURRENT_ATTITUDE == "R":
-                SIM_ROTATION_VECTOR = set_Rotational_Vector(CURRENT_ATTITUDE, SIM_DOT_CUSTOM, SIM_RAND_COEFF, current_orbit)
-                print_attitude_rotation_info(CURRENT_ATTITUDE, SIM_ROTATION_VECTOR, SIM_DOT_CUSTOM)
-            elif CURRENT_ATTITUDE == "C":
-                SIM_ROTATION_VECTOR = set_Rotational_Vector(CURRENT_ATTITUDE, SIM_DOT_CUSTOM, SIM_RAND_COEFF, current_orbit)
-                print_attitude_rotation_info(CURRENT_ATTITUDE, SIM_ROTATION_VECTOR, SIM_DOT_CUSTOM)
-            else:
-                SIM_ROTATION_VECTOR = np.array([0.0,0.0,0.0])
-            PREVIOUS_ATTITUDE = CURRENT_ATTITUDE
+        if DESIRED_ATTITUDE != PREVIOUS_ATTITUDE:
+            ATTITUDE_TRANSITION_ACTIVE = SIM_ATTITUDE_CHANGE_TIME > 0.0
+            ATTITUDE_TRANSITION_START_TIME = SIM_TIME
+            ATTITUDE_TRANSITION_START_NORMALS = [
+                np.array(nod.Normal, dtype=float) if not nod.Internal else 0
+                for nod in Nodes
+            ]
+            ATTITUDE_TRANSITION_TARGET_NORMALS = get_target_normals_for_attitude(
+                Nodes,
+                DESIRED_ATTITUDE,
+                current_orbit,
+                current_time,
+                DESIRED_FIXED_VECTOR,
+            )
+
+            if not ATTITUDE_TRANSITION_ACTIVE:
+                APPLIED_ATTITUDE = DESIRED_ATTITUDE
+                APPLIED_FIXED_VECTOR = DESIRED_FIXED_VECTOR
+
+                if APPLIED_ATTITUDE == "R":
+                    SIM_ROTATION_VECTOR = set_Rotational_Vector(APPLIED_ATTITUDE, SIM_DOT_CUSTOM, SIM_RAND_COEFF, current_orbit)
+                    print_attitude_rotation_info(APPLIED_ATTITUDE, SIM_ROTATION_VECTOR, SIM_DOT_CUSTOM)
+                elif APPLIED_ATTITUDE == "C":
+                    SIM_ROTATION_VECTOR = set_Rotational_Vector(APPLIED_ATTITUDE, SIM_DOT_CUSTOM, SIM_RAND_COEFF, current_orbit)
+                    print_attitude_rotation_info(APPLIED_ATTITUDE, SIM_ROTATION_VECTOR, SIM_DOT_CUSTOM)
+                else:
+                    SIM_ROTATION_VECTOR = np.array([0.0,0.0,0.0])
+
+            PREVIOUS_ATTITUDE = DESIRED_ATTITUDE
 
         SIM_ECLIPSE = Orb.eclipse()
 
         if SIM_MAX_STEPS != 0 and step/SIM_MAX_STEPS*100 > SIM_PERCENTAGE+SIM_PERCENTAGE_STEPUP:
             SIM_PERCENTAGE = SIM_PERCENTAGE + SIM_PERCENTAGE_STEPUP
-            print("Simulation working... " + str(SIM_PERCENTAGE) + "% ("+str(step)+"/"+str(SIM_MAX_STEPS)+")")
+            elapsed_wall_time = pytime.time() - SIM_WALL_START
+            step_progress = step / SIM_MAX_STEPS
+            if step_progress > 0.0:
+                estimated_total_time = elapsed_wall_time / step_progress
+                remaining_wall_time = max(0.0, estimated_total_time - elapsed_wall_time)
+            else:
+                remaining_wall_time = 0.0
+            print(
+                "Simulation working... "
+                + str(SIM_PERCENTAGE)
+                + "% ("
+                + str(step)
+                + "/"
+                + str(SIM_MAX_STEPS)
+                + ") | elapsed "
+                + format_duration(elapsed_wall_time)
+                + " | remaining "
+                + format_duration(remaining_wall_time)
+            )
 
 
         for nod in Nodes:
-            
-            update_Node_Attitude(nod, CURRENT_ATTITUDE, current_orbit, current_time, CURRENT_FIXED_VECTOR)
+            if ATTITUDE_TRANSITION_ACTIVE:
+                break
 
-            if CURRENT_ATTITUDE in ["C", "R"] and step > 0:
-                if CURRENT_ATTITUDE == "C":
-                    SIM_ROTATION_VECTOR = set_Rotational_Vector(CURRENT_ATTITUDE, SIM_DOT_CUSTOM, SIM_RAND_COEFF, current_orbit)
+            update_Node_Attitude(nod, APPLIED_ATTITUDE, current_orbit, current_time, APPLIED_FIXED_VECTOR)
+
+            if APPLIED_ATTITUDE in ["C", "R"] and step > 0:
+                if APPLIED_ATTITUDE == "C":
+                    SIM_ROTATION_VECTOR = set_Rotational_Vector(APPLIED_ATTITUDE, SIM_DOT_CUSTOM, SIM_RAND_COEFF, current_orbit)
                 nod.rotate_Normal(SIM_ROTATION_VECTOR, SIM_STEP_SIZE)
 
+        if ATTITUDE_TRANSITION_ACTIVE:
+            transition_fraction = min(1.0, (SIM_TIME - ATTITUDE_TRANSITION_START_TIME) / SIM_ATTITUDE_CHANGE_TIME)
+            apply_attitude_transition(
+                Nodes,
+                ATTITUDE_TRANSITION_START_NORMALS,
+                ATTITUDE_TRANSITION_TARGET_NORMALS,
+                transition_fraction,
+            )
+
+            if transition_fraction >= 1.0:
+                ATTITUDE_TRANSITION_ACTIVE = False
+                APPLIED_ATTITUDE = DESIRED_ATTITUDE
+                APPLIED_FIXED_VECTOR = DESIRED_FIXED_VECTOR
+
+                if APPLIED_ATTITUDE == "R":
+                    SIM_ROTATION_VECTOR = set_Rotational_Vector(APPLIED_ATTITUDE, SIM_DOT_CUSTOM, SIM_RAND_COEFF, current_orbit)
+                    print_attitude_rotation_info(APPLIED_ATTITUDE, SIM_ROTATION_VECTOR, SIM_DOT_CUSTOM)
+                elif APPLIED_ATTITUDE == "C":
+                    SIM_ROTATION_VECTOR = set_Rotational_Vector(APPLIED_ATTITUDE, SIM_DOT_CUSTOM, SIM_RAND_COEFF, current_orbit)
+                    print_attitude_rotation_info(APPLIED_ATTITUDE, SIM_ROTATION_VECTOR, SIM_DOT_CUSTOM)
+                else:
+                    SIM_ROTATION_VECTOR = np.array([0.0,0.0,0.0])
+
+        ATTITUDE_HISTORY.append(APPLIED_ATTITUDE if not ATTITUDE_TRANSITION_ACTIVE else "TRANSITION")
+
+        for nod in Nodes:
             nod.update_angles(Orb, current_time)
 
 
@@ -1958,7 +2172,17 @@ def main():
     # END OF SIMULATION ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
     SIM_PERCENTAGE = SIM_PERCENTAGE + SIM_PERCENTAGE_STEPUP
-    print("Simulation finished " + str(SIM_PERCENTAGE) + "% ("+str(step)+"/"+str(SIM_MAX_STEPS)+")")
+    total_wall_time = pytime.time() - SIM_WALL_START
+    print(
+        "Simulation finished "
+        + str(SIM_PERCENTAGE)
+        + "% ("
+        + str(step)
+        + "/"
+        + str(SIM_MAX_STEPS)
+        + ") | total "
+        + format_duration(total_wall_time)
+    )
 
 
     # DATA MANIPULATION 
@@ -1998,6 +2222,7 @@ def main():
             Nodes,
             ORBIT_ARRAY,
             Orb.EclipseHistory,
+            ATTITUDE_HISTORY,
             SIM_MIN_TEMP,
             SIM_MAX_TEMP,
         )
@@ -2006,17 +2231,20 @@ def main():
         plot_power_history(
             ORBIT_ARRAY,
             Orb.EclipseHistory,
+            ATTITUDE_HISTORY,
             POWER_STATE,
         )
         plot_battery_soc_history(
             ORBIT_ARRAY,
             Orb.EclipseHistory,
+            ATTITUDE_HISTORY,
             POWER_STATE,
         )
         plot_node_generated_power(
             Nodes,
             ORBIT_ARRAY,
             Orb.EclipseHistory,
+            ATTITUDE_HISTORY,
         )
 
     save_all_figures(output_dir)
