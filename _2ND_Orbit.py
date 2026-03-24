@@ -1,3 +1,10 @@
+"""Orbital geometry utilities used by the thermal and power simulator.
+
+This module stores the current orbit state and exposes helper transforms that
+convert between mission-friendly frames (RTH, Sun-aligned, inertial XYZ) and
+the inertial frame used by the rest of the simulation.
+"""
+
 import numpy as np
 from astropy import units as u
 from astropy.time import Time
@@ -7,8 +14,10 @@ from poliastro.twobody import Orbit
 
 
 class _2ND_Orbit:
+    """Container for the spacecraft orbit and environment-dependent quantities."""
 
     def __init__(self):
+        # Global environment values used by the thermal/power models.
         self.Rearth = 0
         self.Fsun = 0
         self.Fearth = 0
@@ -28,6 +37,7 @@ class _2ND_Orbit:
 
     @staticmethod
     def RTH_to_GCRS_Matrix(orb):
+        """Build the rotation matrix from the local RTH frame to inertial GCRS."""
         r_dot = orb.r.value/np.linalg.norm(orb.r.value)
 
         h_dot = orb.h_vec.value/np.linalg.norm(orb.h_vec.value)
@@ -44,6 +54,7 @@ class _2ND_Orbit:
 
     @staticmethod
     def RTH_to_GCRS(vector, orb):
+        """Rotate a vector written in the local RTH frame into inertial GCRS."""
 
         r_dot = orb.r.value/np.linalg.norm(orb.r.value)
 
@@ -61,6 +72,7 @@ class _2ND_Orbit:
 
     @staticmethod
     def SUNXYZ_to_GCRS(vector, epoch):
+        """Rotate a vector from a Sun-aligned frame into inertial GCRS."""
 
         S = get_sun(epoch).cartesian.xyz.value
 
@@ -80,10 +92,12 @@ class _2ND_Orbit:
 
     @staticmethod
     def INERTIALXYZ_to_GCRS(vector):
+        """Pass-through helper for vectors already expressed in inertial XYZ."""
         return np.array(vector, dtype=float)
 
     @staticmethod
     def get_nadir_rotation_vector(orb):
+        """Angular-rate vector that keeps the spacecraft nadir-pointing."""
         r_norm = np.linalg.norm(orb.r.value)
         return orb.h_vec.value/(r_norm*r_norm)
 
@@ -155,6 +169,7 @@ class _2ND_Orbit:
 
 
     def create_orbit(self):
+        """Create the poliastro orbit object from the spreadsheet parameters."""
 
         if self.LTAN is not None:
             self.RAAN = self.ltan_to_raan(self.LTAN, self.Epoch).to(u.rad).value
@@ -165,5 +180,6 @@ class _2ND_Orbit:
 
 
     def propagate_orbit(self, delta_t):
+        """Advance the stored orbit state by the given propagation time."""
 
         self.Orbit = self.Orbit.propagate(delta_t)

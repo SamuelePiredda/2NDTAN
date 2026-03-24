@@ -1,3 +1,11 @@
+"""Main entry point for the 2NDTAN CubeSat thermal and power simulator.
+
+The file is intentionally split into large regions: utility helpers, EPS
+bookkeeping, thermal balance and integration, reporting/export, attitude and
+mission parsing, and finally the spreadsheet-driven simulation driver in
+``main()``.
+"""
+
 from _2ND_Orbit import _2ND_Orbit
 from _2ND_Nodes import Node
 
@@ -24,7 +32,9 @@ from tkinter import filedialog
 CONST_SIGMA = 5.67e-8
 
 
-
+# ---------------------------------------------------------------------------
+# Debug / formatting helpers
+# ---------------------------------------------------------------------------
 def DEBUG_printNodes(node_array):
     """
     Iterates through an array of node objects and prints their parameters 
@@ -80,6 +90,9 @@ def format_duration(seconds):
     return f"{minutes:02d}:{secs:02d}"
 
 
+# ---------------------------------------------------------------------------
+# Electrical power model helpers
+# ---------------------------------------------------------------------------
 def _positive_cos_deg(angle_deg):
     return max(0.0, np.cos(np.deg2rad(angle_deg)))
 
@@ -100,6 +113,7 @@ def _solar_cell_efficiency(temp_k, power_state):
 
 
 def electrical_power_generated_by_node(node, Orbit, power_state):
+    """Return the raw electrical power produced by one solar-cell node."""
     if power_state is None or not power_state["enabled"]:
         return 0.0
     if node.Internal or node.NumCells <= 0:
@@ -119,13 +133,49 @@ def electrical_power_generated_by_node(node, Orbit, power_state):
     return incident_power * _solar_cell_efficiency(node.Temp, power_state)
 
 
+def _distribute_served_power(requested_power, available_power):
+    """Scale requested loads when the bus cannot serve the full demand."""
+    requested_power = np.array(requested_power, dtype=float)
+    served_power = np.zeros_like(requested_power)
+
+    total_requested = float(np.sum(requested_power))
+    if total_requested <= 0.0 or available_power <= 0.0:
+        return served_power
+
+    if available_power >= total_requested:
+        return requested_power.copy()
+
+    return requested_power * (available_power / total_requested)
+
+
+def _apply_power_balance_to_nodes(Nodes, power_balance):
+    """Copy solved EPS results into the node objects for this step."""
+    for i, nod in enumerate(Nodes):
+        nod.PowerGenerated = power_balance["node_generated"][i]
+        nod.Qsolar_electric = nod.PowerGenerated
+        nod.Qint_effective = power_balance["served_internal_power"][i]
+        nod.Qheater_effective = power_balance["served_heater_power"][i]
+        nod.Qbattery_loss = 0.0
+
+    battery_node_index = power_balance["battery_node"]
+    if battery_node_index is not None:
+        Nodes[battery_node_index].Qbattery_loss = power_balance["battery_loss_power"]
+
+
 def evaluate_power_balance(Nodes, Orbit, power_state, dt, battery_cap=None):
+    """Solve power generation, battery flow, and served loads for one step."""
+    requested_internal_power = np.array([max(0.0, nod.Qint) for nod in Nodes], dtype=float)
+    requested_heater_power = np.array([max(0.0, nod.Qheater) for nod in Nodes], dtype=float)
+    total_requested_internal = float(np.sum(requested_internal_power))
+    total_requested_heater = float(np.sum(requested_heater_power))
+    total_requested_load = total_requested_internal + total_requested_heater
+
     if power_state is None or not power_state["enabled"]:
         return {
             "node_generated": [0.0] * len(Nodes),
             "total_generated_raw": 0.0,
-            "total_load": 0.0,
-            "total_heater_power": 0.0,
+            "total_load": total_requested_load,
+            "total_heater_power": total_requested_heater,
             "solar_bus_power": 0.0,
             "charge_power": 0.0,
             "discharge_power": 0.0,
@@ -133,6 +183,12 @@ def evaluate_power_balance(Nodes, Orbit, power_state, dt, battery_cap=None):
             "unmet_power": 0.0,
             "battery_loss_power": 0.0,
             "battery_cap_after": battery_cap if battery_cap is not None else 0.0,
+            "battery_too_cold": False,
+            "battery_node": None,
+            "served_internal_power": requested_internal_power.tolist(),
+            "served_heater_power": requested_heater_power.tolist(),
+            "requested_load": total_requested_load,
+            "served_load": total_requested_load,
         }
 
     if battery_cap is None:
@@ -140,15 +196,11 @@ def evaluate_power_balance(Nodes, Orbit, power_state, dt, battery_cap=None):
 
     node_generated = []
     total_generated_raw = 0.0
-    total_load = 0.0
-    total_heater_power = 0.0
 
     for nod in Nodes:
         generated_power = electrical_power_generated_by_node(nod, Orbit, power_state)
         node_generated.append(generated_power)
         total_generated_raw = total_generated_raw + generated_power
-        total_load = total_load + nod.Qint + nod.Qheater
-        total_heater_power = total_heater_power + nod.Qheater
 
     solar_bus_power = total_generated_raw * power_state["sa_eff"]
     battery_node_index = power_state["battery_node"]
@@ -163,10 +215,14 @@ def evaluate_power_balance(Nodes, Orbit, power_state, dt, battery_cap=None):
     unmet_power = 0.0
     battery_loss_power = 0.0
     battery_cap_after = battery_cap
+    served_internal_power = np.zeros(len(Nodes), dtype=float)
+    served_heater_power = np.zeros(len(Nodes), dtype=float)
 
-    net_bus_power = solar_bus_power - total_load
+    net_bus_power = solar_bus_power - total_requested_load
 
     if net_bus_power >= 0.0:
+        served_internal_power = requested_internal_power.copy()
+        served_heater_power = requested_heater_power.copy()
         requested_charge_power = min(net_bus_power, power_state["max_charge"])
 
         if not battery_too_cold and power_state["charge_eff"] > 0.0 and dt > 0.0:
@@ -189,12 +245,20 @@ def evaluate_power_balance(Nodes, Orbit, power_state, dt, battery_cap=None):
             battery_loss_power = discharge_power * (1.0 / power_state["discharge_eff"] - 1.0)
 
         unmet_power = max(0.0, -net_bus_power - discharge_power)
+        served_load = max(0.0, total_requested_load - unmet_power)
+        served_heater_total = min(total_requested_heater, served_load)
+        served_heater_power = _distribute_served_power(requested_heater_power, served_heater_total)
+        served_internal_total = max(0.0, served_load - served_heater_total)
+        served_internal_power = _distribute_served_power(requested_internal_power, served_internal_total)
+
+    total_served_load = float(np.sum(served_internal_power) + np.sum(served_heater_power))
+    total_served_heater = float(np.sum(served_heater_power))
 
     return {
         "node_generated": node_generated,
         "total_generated_raw": total_generated_raw,
-        "total_load": total_load,
-        "total_heater_power": total_heater_power,
+        "total_load": total_served_load,
+        "total_heater_power": total_served_heater,
         "solar_bus_power": solar_bus_power,
         "charge_power": charge_power,
         "discharge_power": discharge_power,
@@ -203,10 +267,16 @@ def evaluate_power_balance(Nodes, Orbit, power_state, dt, battery_cap=None):
         "battery_loss_power": battery_loss_power,
         "battery_cap_after": battery_cap_after,
         "battery_too_cold": battery_too_cold,
+        "battery_node": battery_node_index,
+        "served_internal_power": served_internal_power.tolist(),
+        "served_heater_power": served_heater_power.tolist(),
+        "requested_load": total_requested_load,
+        "served_load": total_served_load,
     }
 
 
 def set_heater_power_for_step(Nodes, Orbit, power_state):
+    """Command battery-heater power before the coupled EPS/thermal solve."""
     for nod in Nodes:
         nod.Qheater = 0.0
 
@@ -218,10 +288,6 @@ def set_heater_power_for_step(Nodes, Orbit, power_state):
         return 0.0
 
     if Nodes[battery_node_index].Temp < power_state["battery_min_temp"]:
-        base_power_balance = evaluate_power_balance(Nodes, Orbit, power_state, 0.0)
-        if base_power_balance["solar_bus_power"] <= base_power_balance["total_load"]:
-            return 0.0
-
         heater_power = power_state["heater_power"]
         Nodes[battery_node_index].Qheater = heater_power
         return heater_power
@@ -230,19 +296,12 @@ def set_heater_power_for_step(Nodes, Orbit, power_state):
 
 
 def advance_power_simulation(Nodes, Orbit, power_state, dt):
+    """Advance EPS histories once the current-step balance is known."""
     if power_state is None or not power_state["enabled"]:
         return
 
     power_balance = evaluate_power_balance(Nodes, Orbit, power_state, dt)
-
-    for i, nod in enumerate(Nodes):
-        nod.PowerGenerated = power_balance["node_generated"][i]
-        nod.Qsolar_electric = nod.PowerGenerated
-        nod.Qbattery_loss = 0.0
-
-    battery_node_index = power_state["battery_node"]
-    if battery_node_index is not None:
-        Nodes[battery_node_index].Qbattery_loss = power_balance["battery_loss_power"]
+    _apply_power_balance_to_nodes(Nodes, power_balance)
 
     battery_cap_before = power_state["battery_cap"]
     power_state["battery_history"].append(battery_cap_before)
@@ -250,6 +309,7 @@ def advance_power_simulation(Nodes, Orbit, power_state, dt):
     power_state["solar_generation_history"].append(power_balance["total_generated_raw"])
     power_state["solar_bus_power_history"].append(power_balance["solar_bus_power"])
     power_state["load_power_history"].append(power_balance["total_load"])
+    power_state["requested_load_power_history"].append(power_balance["requested_load"])
     power_state["heater_power_history"].append(power_balance["total_heater_power"])
     power_state["battery_loss_power_history"].append(power_balance["battery_loss_power"])
     power_state["charge_power_history"].append(power_balance["charge_power"])
@@ -258,7 +318,11 @@ def advance_power_simulation(Nodes, Orbit, power_state, dt):
     power_state["unmet_power_history"].append(power_balance["unmet_power"])
 
 
+# ---------------------------------------------------------------------------
+# Thermal model and numerical integration
+# ---------------------------------------------------------------------------
 def dQ(Nodes, Orbit, VF_MATRIX, COND_MATRIX, COND_DIST_MATRIX, dt=0.0, power_state=None):
+    """Assemble the net heat flow on every node in Watts."""
 
     for nod in Nodes:
         nod.Qsun = 0.0
@@ -278,15 +342,10 @@ def dQ(Nodes, Orbit, VF_MATRIX, COND_MATRIX, COND_DIST_MATRIX, dt=0.0, power_sta
             nod.Q = nod.Q + nod.Qsun + nod.Qalbedo
 
     power_balance = evaluate_power_balance(Nodes, Orbit, power_state, dt)
+    _apply_power_balance_to_nodes(Nodes, power_balance)
 
-    for i, nod in enumerate(Nodes):
-        nod.Qsolar_electric = power_balance["node_generated"][i]
-        nod.PowerGenerated = nod.Qsolar_electric
+    for nod in Nodes:
         nod.Q = nod.Q - nod.Qsolar_electric
-
-    battery_node_index = None if power_state is None else power_state["battery_node"]
-    if battery_node_index is not None:
-        Nodes[battery_node_index].Qbattery_loss = power_balance["battery_loss_power"]
 
     # EARTH INFRARED
     for nod in Nodes:
@@ -302,7 +361,7 @@ def dQ(Nodes, Orbit, VF_MATRIX, COND_MATRIX, COND_DIST_MATRIX, dt=0.0, power_sta
 
     # INTERNAL DISSIPATION
     for nod in Nodes:
-        nod.Q = nod.Q + nod.Qint + nod.Qheater + nod.Qbattery_loss
+        nod.Q = nod.Q + nod.Qint_effective + nod.Qheater_effective + nod.Qbattery_loss
 
     # CONDUCTION
     for row in range(0, len(Nodes)):
@@ -344,6 +403,7 @@ def dQ(Nodes, Orbit, VF_MATRIX, COND_MATRIX, COND_DIST_MATRIX, dt=0.0, power_sta
 
 
 def dTemperature(Nodes, deltaQ, dt):
+    """Convert a heat-flow vector into a temperature increment over ``dt``."""
     deltaT = np.zeros(len(Nodes), dtype=float)
 
     for i, nod in enumerate(Nodes):
@@ -356,6 +416,7 @@ def dTemperature(Nodes, deltaQ, dt):
 
 
 def _set_node_temperatures(Nodes, temperatures):
+    """Overwrite the node temperatures with a vector state."""
     for i, nod in enumerate(Nodes):
         nod.Temp = float(temperatures[i])
 
@@ -370,6 +431,7 @@ def _delta_q_at_temperatures(
     temperatures,
     power_state=None,
 ):
+    """Evaluate the thermal balance after temporarily setting trial temperatures."""
     _set_node_temperatures(Nodes, temperatures)
     return dQ(Nodes, Orbit, VF_MATRIX, COND_MATRIX, COND_DIST_MATRIX, dt, power_state)
 
@@ -384,6 +446,7 @@ def _explicit_substepped_temperature_step(
     power_state=None,
     max_substeps=1024,
 ):
+    """Fallback explicit integrator that subdivides the step until stable."""
     base_temperatures = np.array([nod.Temp for nod in Nodes], dtype=float)
     substeps = 1
 
@@ -430,6 +493,7 @@ def implicit_euler_temperature_step(
     maxfev=200,
     tol=1e-6,
 ):
+    """Implicit-Euler thermal step with an explicit fallback when needed."""
     old_temperatures = np.array([nod.Temp for nod in Nodes], dtype=float)
 
     def residual(new_temperatures):
@@ -478,16 +542,19 @@ def implicit_euler_temperature_step(
             stacklevel=2,
         )
 
+    _set_node_temperatures(Nodes, solution)
+    dQ(Nodes, Orbit, VF_MATRIX, COND_MATRIX, COND_DIST_MATRIX, dt, power_state)
     _set_node_temperatures(Nodes, old_temperatures)
 
     for i, nod in enumerate(Nodes):
         nod.updateTemp(solution[i])
 
-    # Refresh the node heat terms with the converged temperatures.
-    dQ(Nodes, Orbit, VF_MATRIX, COND_MATRIX, COND_DIST_MATRIX, dt, power_state)
 
-
+# ---------------------------------------------------------------------------
+# Plotting and end-of-run reporting
+# ---------------------------------------------------------------------------
 def _shade_eclipse_regions(ax, time_array, eclipse_history):
+    """Shade periods where the spacecraft is in eclipse or penumbra."""
     eclipse_start = None
 
     for i, eclipse_value in enumerate(eclipse_history):
@@ -505,6 +572,7 @@ def _shade_eclipse_regions(ax, time_array, eclipse_history):
 
 
 def _shade_transition_regions(ax, time_array, attitude_history):
+    """Shade attitude-transition windows on top of an existing plot."""
     transition_start = None
     added_label = False
 
@@ -538,6 +606,7 @@ def _shade_transition_regions(ax, time_array, attitude_history):
 
 
 def _label_horizontal_line(ax, y_value, text, color):
+    """Place a label near a horizontal requirement/reference line."""
     x_min, x_max = ax.get_xlim()
     x_text = x_max - 0.02 * (x_max - x_min if x_max != x_min else 1.0)
     ax.annotate(
@@ -555,6 +624,7 @@ def _label_horizontal_line(ax, y_value, text, color):
 
 
 def plot_temperature_groups(Nodes, time_array, eclipse_history, attitude_history, temp_min_k, temp_max_k):
+    """Plot node temperatures grouped by the spreadsheet plot-group index."""
     groups = sorted({nod.PlotGroup for nod in Nodes})
     temp_min_c = temp_min_k - 273.15
     temp_max_c = temp_max_k - 273.15
@@ -581,7 +651,25 @@ def plot_temperature_groups(Nodes, time_array, eclipse_history, attitude_history
         ax.legend(loc="lower right")
 
 
+def print_temperature_statistics(Nodes):
+    """Print min/mean/max temperature reached by every node."""
+    if len(Nodes) == 0:
+        return
+
+    print("\nTemperature summary by node [C]")
+    print(f"{'Node':<24} {'Min':>10} {'Average':>10} {'Max':>10}")
+    print("-" * 58)
+
+    for nod in Nodes:
+        history = np.array(nod.TempHistory if len(nod.TempHistory) > 0 else [nod.Temp], dtype=float)
+        temp_min_c = float(np.min(history) - 273.15)
+        temp_avg_c = float(np.mean(history) - 273.15)
+        temp_max_c = float(np.max(history) - 273.15)
+        print(f"{nod.Name:<24} {temp_min_c:>10.2f} {temp_avg_c:>10.2f} {temp_max_c:>10.2f}")
+
+
 def plot_power_history(time_array, eclipse_history, attitude_history, power_state):
+    """Plot spacecraft-level EPS energy and power histories."""
     if power_state is None or not power_state["enabled"]:
         return
     if len(power_state["battery_history"]) != len(time_array):
@@ -618,6 +706,7 @@ def plot_power_history(time_array, eclipse_history, attitude_history, power_stat
 
 
 def plot_battery_soc_history(time_array, eclipse_history, attitude_history, power_state):
+    """Plot battery state-of-charge history."""
     if power_state is None or not power_state["enabled"]:
         return
     if len(power_state["battery_history"]) != len(time_array):
@@ -644,6 +733,7 @@ def plot_battery_soc_history(time_array, eclipse_history, attitude_history, powe
 
 
 def plot_node_generated_power(Nodes, time_array, eclipse_history, attitude_history):
+    """Plot electrical generation history for each solar-cell node."""
     nodes_with_cells = [nod for nod in Nodes if nod.NumCells > 0]
     if len(nodes_with_cells) == 0:
         return
@@ -663,7 +753,66 @@ def plot_node_generated_power(Nodes, time_array, eclipse_history, attitude_histo
     ax.legend(loc="lower right")
 
 
+def _average_series_per_orbit(orbit_array, values):
+    """Reduce a stepwise time history into one average value per orbit."""
+    if len(orbit_array) == 0 or len(values) == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    sample_count = min(len(orbit_array), len(values))
+    orbit_values = np.array(orbit_array[:sample_count], dtype=float)
+    series_values = np.array(values[:sample_count], dtype=float)
+    orbit_indices = np.floor(np.clip(orbit_values, 0.0, None) + 1e-9).astype(int)
+
+    orbit_numbers = []
+    orbit_averages = []
+
+    for orbit_index in sorted(np.unique(orbit_indices)):
+        mask = orbit_indices == orbit_index
+        mask = mask & np.isfinite(series_values)
+        if not np.any(mask):
+            continue
+        orbit_numbers.append(float(orbit_index + 1))
+        orbit_averages.append(float(np.mean(series_values[mask])))
+
+    return np.array(orbit_numbers, dtype=float), np.array(orbit_averages, dtype=float)
+
+
+def print_power_summary(Nodes, orbit_array, power_state):
+    """Print peak per-node generation and orbit-averaged power numbers."""
+    if power_state is None or not power_state["enabled"]:
+        return
+
+    nodes_with_cells = [nod for nod in Nodes if nod.NumCells > 0]
+
+    if len(nodes_with_cells) > 0:
+        print("\nMaximum generated power by node [W]")
+        print(f"{'Node':<24} {'Max Generated':>14}")
+        print("-" * 40)
+        for nod in nodes_with_cells:
+            history = np.array(nod.PowerGeneratedHistory if len(nod.PowerGeneratedHistory) > 0 else [nod.PowerGenerated], dtype=float)
+            print(f"{nod.Name:<24} {float(np.max(history)):>14.2f}")
+
+    orbit_numbers_gen, orbit_avg_gen = _average_series_per_orbit(orbit_array, power_state["solar_generation_history"])
+    orbit_numbers_load, orbit_avg_load = _average_series_per_orbit(orbit_array, power_state["load_power_history"])
+
+    orbit_ids = sorted({int(value) for value in orbit_numbers_gen.tolist()} | {int(value) for value in orbit_numbers_load.tolist()})
+    if len(orbit_ids) == 0:
+        return
+
+    gen_by_orbit = {int(orbit_numbers_gen[i]): float(orbit_avg_gen[i]) for i in range(len(orbit_numbers_gen))}
+    load_by_orbit = {int(orbit_numbers_load[i]): float(orbit_avg_load[i]) for i in range(len(orbit_numbers_load))}
+
+    print("\nAverage power per orbit [W]")
+    print(f"{'Orbit':<10} {'Generated':>12} {'Consumption':>14}")
+    print("-" * 40)
+    for orbit_id in orbit_ids:
+        generated_value = gen_by_orbit.get(orbit_id, float("nan"))
+        load_value = load_by_orbit.get(orbit_id, float("nan"))
+        print(f"{orbit_id:<10} {generated_value:>12.2f} {load_value:>14.2f}")
+
+
 def _series_to_length(values, target_len):
+    """Pad or trim a list so CSV columns all share the same length."""
     values = list(values)
     if len(values) >= target_len:
         return values[:target_len]
@@ -671,6 +820,7 @@ def _series_to_length(values, target_len):
 
 
 def _safe_filename(text):
+    """Turn plot titles / labels into safe filenames."""
     safe_chars = []
     for char in str(text):
         if char.isalnum() or char in ["-", "_"]:
@@ -682,6 +832,7 @@ def _safe_filename(text):
 
 
 def export_simulation_csv(output_dir, base_name, orbit_array, time_array, eclipse_history, attitude_history, Nodes, power_state):
+    """Export all recorded histories to a CSV file in the output directory."""
     target_len = len(orbit_array)
     data = {
         "orbit": _series_to_length(orbit_array, target_len),
@@ -713,6 +864,7 @@ def export_simulation_csv(output_dir, base_name, orbit_array, time_array, eclips
         data["solar_generation_raw_W"] = _series_to_length(power_state["solar_generation_history"], target_len)
         data["solar_bus_power_W"] = _series_to_length(power_state["solar_bus_power_history"], target_len)
         data["load_power_W"] = _series_to_length(power_state["load_power_history"], target_len)
+        data["requested_load_power_W"] = _series_to_length(power_state["requested_load_power_history"], target_len)
         data["heater_power_total_W"] = _series_to_length(power_state["heater_power_history"], target_len)
         data["battery_loss_power_total_W"] = _series_to_length(power_state["battery_loss_power_history"], target_len)
         data["charge_power_W"] = _series_to_length(power_state["charge_power_history"], target_len)
@@ -724,6 +876,7 @@ def export_simulation_csv(output_dir, base_name, orbit_array, time_array, eclips
 
 
 def save_all_figures(output_dir):
+    """Save every open matplotlib figure into the simulation output folder."""
     used_names = set()
 
     for fig_number in plt.get_fignums():
@@ -743,7 +896,11 @@ def save_all_figures(output_dir):
         fig.savefig(os.path.join(output_dir, file_name + ".png"), dpi=300, bbox_inches="tight")
 
 
+# ---------------------------------------------------------------------------
+# Mission-sheet parsing and time-varying commands
+# ---------------------------------------------------------------------------
 def parse_fixed_pointing_vector(text):
+    """Parse a fixed inertial pointing vector from the mission sheet."""
     tmp = str(text).split(',')
     if len(tmp) != 3:
         raise ValueError("Fixed pointing vector must be in the form X,Y,Z")
@@ -757,6 +914,7 @@ def parse_fixed_pointing_vector(text):
 
 
 def read_attitude_mission_sheet(file_path, data_protection):
+    """Load the optional attitude mission sheet into a sorted event list."""
     mission_state = {
         "events": [],
         "repeat": False,
@@ -810,6 +968,7 @@ def read_attitude_mission_sheet(file_path, data_protection):
 
 
 def read_power_mission_sheet(file_path, node_names, data_protection):
+    """Load the optional internal-power mission sheet into a sorted event list."""
     mission_state = {
         "events": [],
         "repeat": False,
@@ -863,6 +1022,7 @@ def read_power_mission_sheet(file_path, node_names, data_protection):
 
 
 def get_mission_attitude_state(orbit_unit, default_attitude, default_fixed_vector, mission_state):
+    """Return the active commanded attitude for the current orbit fraction."""
     if mission_state is None or len(mission_state["events"]) == 0:
         return default_attitude, default_fixed_vector
 
@@ -895,6 +1055,7 @@ def get_mission_attitude_state(orbit_unit, default_attitude, default_fixed_vecto
 
 
 def get_mission_power_state(orbit_unit, default_node_power, mission_state):
+    """Return the active internal node powers for the current orbit fraction."""
     if mission_state is None or len(mission_state["events"]) == 0:
         return dict(default_node_power)
 
@@ -917,12 +1078,17 @@ def get_mission_power_state(orbit_unit, default_node_power, mission_state):
 
 
 def apply_power_mission_to_nodes(Nodes, node_power_state):
+    """Write mission-commanded internal power values into the node list."""
     for nod in Nodes:
         if nod.Name in node_power_state:
             nod.Qint = node_power_state[nod.Name]
 
 
-def get_target_normals_for_attitude(Nodes, attitude, orb, epoch, fixed_vector=None):
+# ---------------------------------------------------------------------------
+# Attitude geometry helpers
+# ---------------------------------------------------------------------------
+def get_target_normals_for_attitude(Nodes, attitude, orb, epoch, fixed_vector=None, fixed_reference_vector=None):
+    """Build the set of target normals used during an attitude transition."""
     target_normals = []
 
     for nod in Nodes:
@@ -933,7 +1099,7 @@ def get_target_normals_for_attitude(Nodes, attitude, orb, epoch, fixed_vector=No
         elif attitude == "S":
             target_normals.append(setup_norm_vector(nod.Normal_Sun, "S", orb, epoch))
         elif attitude == "F":
-            target_normals.append(setup_norm_vector(nod.Normal_Sun, "F", orb, epoch, fixed_vector))
+            target_normals.append(setup_norm_vector(nod.Normal_Sun, "F", orb, epoch, fixed_vector, fixed_reference_vector))
         else:
             target_normals.append(np.array(nod.Normal, dtype=float))
 
@@ -941,6 +1107,7 @@ def get_target_normals_for_attitude(Nodes, attitude, orb, epoch, fixed_vector=No
 
 
 def slerp_vectors(v0, v1, fraction):
+    """Spherical linear interpolation used for smooth attitude transitions."""
     v0 = np.array(v0, dtype=float)
     v1 = np.array(v1, dtype=float)
     v0 = v0 / np.linalg.norm(v0)
@@ -975,6 +1142,7 @@ def slerp_vectors(v0, v1, fraction):
 
 
 def apply_attitude_transition(Nodes, start_normals, target_normals, fraction):
+    """Apply one fraction of the transition between two full-attitude states."""
     fraction = float(np.clip(fraction, 0.0, 1.0))
 
     for i, nod in enumerate(Nodes):
@@ -983,7 +1151,87 @@ def apply_attitude_transition(Nodes, start_normals, target_normals, fraction):
         nod.Normal = slerp_vectors(start_normals[i], target_normals[i], fraction)
 
 
-def fixed_xyz_to_gcrs(vector, fixed_direction):
+def _rotation_matrix_from_axis_angle(axis, angle):
+    """Create a rotation matrix from an axis-angle description."""
+    axis = np.array(axis, dtype=float)
+    axis = axis / np.linalg.norm(axis)
+    x_val, y_val, z_val = axis
+    cross_matrix = np.array(
+        [
+            [0.0, -z_val, y_val],
+            [z_val, 0.0, -x_val],
+            [-y_val, x_val, 0.0],
+        ],
+        dtype=float,
+    )
+    identity = np.eye(3)
+    return identity + np.sin(angle) * cross_matrix + (1.0 - np.cos(angle)) * (cross_matrix @ cross_matrix)
+
+
+def _rotation_matrix_between_vectors(v_from, v_to):
+    """Build the shortest-rotation matrix that maps one unit vector to another."""
+    v_from = np.array(v_from, dtype=float)
+    v_to = np.array(v_to, dtype=float)
+    v_from = v_from / np.linalg.norm(v_from)
+    v_to = v_to / np.linalg.norm(v_to)
+
+    dot_value = np.clip(np.dot(v_from, v_to), -1.0, 1.0)
+
+    if dot_value > 0.999999:
+        return np.eye(3)
+
+    if dot_value < -0.999999:
+        reference = np.array([1.0, 0.0, 0.0], dtype=float)
+        if abs(np.dot(v_from, reference)) > 0.9:
+            reference = np.array([0.0, 1.0, 0.0], dtype=float)
+        axis = np.cross(v_from, reference)
+        return _rotation_matrix_from_axis_angle(axis, np.pi)
+
+    cross_value = np.cross(v_from, v_to)
+    skew_matrix = np.array(
+        [
+            [0.0, -cross_value[2], cross_value[1]],
+            [cross_value[2], 0.0, -cross_value[0]],
+            [-cross_value[1], cross_value[0], 0.0],
+        ],
+        dtype=float,
+    )
+    identity = np.eye(3)
+    return identity + skew_matrix + (skew_matrix @ skew_matrix) * ((1.0 - dot_value) / (np.linalg.norm(cross_value) ** 2))
+
+
+def parse_xyz_frame_vector(text):
+    """Parse X/Y/Z symbolic or numeric vectors used by the attitude sheets."""
+    text = str(text).strip().upper()
+
+    if text in ["X", "+X"]:
+        return np.array([1.0, 0.0, 0.0], dtype=float)
+    if text == "-X":
+        return np.array([-1.0, 0.0, 0.0], dtype=float)
+    if text in ["Y", "+Y"]:
+        return np.array([0.0, 1.0, 0.0], dtype=float)
+    if text == "-Y":
+        return np.array([0.0, -1.0, 0.0], dtype=float)
+    if text in ["Z", "+Z"]:
+        return np.array([0.0, 0.0, 1.0], dtype=float)
+    if text == "-Z":
+        return np.array([0.0, 0.0, -1.0], dtype=float)
+    if text == "I":
+        return None
+
+    tmp = text.split(',')
+    if len(tmp) != 3:
+        raise ValueError("Local XYZ vector must have three components")
+
+    vector = np.array([float(tmp[0]), float(tmp[1]), float(tmp[2])], dtype=float)
+    norm = np.linalg.norm(vector)
+    if norm == 0.0:
+        raise ValueError("Local XYZ vector cannot be zero")
+    return vector / norm
+
+
+def fixed_xyz_to_gcrs(vector, fixed_direction, pointing_reference_vector=None):
+    """Convert a local spacecraft vector into inertial GCRS for fixed pointing."""
     x_dot = np.array(fixed_direction, dtype=float)
     x_dot = x_dot / np.linalg.norm(x_dot)
 
@@ -997,17 +1245,25 @@ def fixed_xyz_to_gcrs(vector, fixed_direction):
     z_dot = np.cross(x_dot, y_dot)
     z_dot = z_dot / np.linalg.norm(z_dot)
 
+    local_reference = np.array([1.0, 0.0, 0.0], dtype=float)
+    if pointing_reference_vector is not None:
+        local_reference = np.array(pointing_reference_vector, dtype=float)
+        local_reference = local_reference / np.linalg.norm(local_reference)
+
+    local_alignment = _rotation_matrix_between_vectors(local_reference, np.array([1.0, 0.0, 0.0], dtype=float))
     m_xyz_to_gcrs = np.vstack((x_dot, y_dot, z_dot)).T
-    return m_xyz_to_gcrs @ np.array(vector, dtype=float)
+    return m_xyz_to_gcrs @ (local_alignment @ np.array(vector, dtype=float))
 
 
 def print_attitude_rotation_info(attitude, rotation_vector, custom_vector):
+    """Echo the commanded rotational-rate information to the terminal."""
     if attitude == "R":
+        rotation_vector_deg = np.rad2deg(rotation_vector)
         print(
             "Random attitude rotation [deg/s]: "
-            + f"X={rotation_vector[0]:.3f}, "
-            + f"Y={rotation_vector[1]:.3f}, "
-            + f"Z={rotation_vector[2]:.3f}"
+            + f"X={rotation_vector_deg[0]:.3f}, "
+            + f"Y={rotation_vector_deg[1]:.3f}, "
+            + f"Z={rotation_vector_deg[2]:.3f}"
         )
     elif attitude == "C":
         print(
@@ -1020,6 +1276,7 @@ def print_attitude_rotation_info(attitude, rotation_vector, custom_vector):
 
 
 def set_Rotational_Vector(attitude, custom, random_coeff, orb):
+    """Return the angular-rate vector associated with the chosen attitude mode."""
 
     if attitude == "S":
         return np.array([0,0,0])
@@ -1029,9 +1286,9 @@ def set_Rotational_Vector(attitude, custom, random_coeff, orb):
         X = (random.random() - 0.5)*2*random_coeff
         Y = (random.random() - 0.5)*2*random_coeff
         Z = (random.random() - 0.5)*2*random_coeff
-        return np.array([X,Y,Z])
+        return np.deg2rad(np.array([X,Y,Z], dtype=float))
     elif attitude == "C":
-        return _2ND_Orbit.RTH_to_GCRS(custom, orb)
+        return _2ND_Orbit.RTH_to_GCRS(np.deg2rad(custom), orb)
     # INTERTIAL POINTING
     elif attitude == "F":
         return np.array([0,0,0])
@@ -1042,7 +1299,8 @@ def set_Rotational_Vector(attitude, custom, random_coeff, orb):
 
 
 
-def update_Node_Attitude(node, attitude, orb, epoch, fixed_vector=None):
+def update_Node_Attitude(node, attitude, orb, epoch, fixed_vector=None, fixed_reference_vector=None):
+    """Update one node normal according to the currently applied attitude mode."""
     if node.Internal:
         return
 
@@ -1051,19 +1309,22 @@ def update_Node_Attitude(node, attitude, orb, epoch, fixed_vector=None):
     elif attitude == "S":
         node.Normal = setup_norm_vector(node.Normal_Sun, "S", orb, epoch)
     elif attitude == "F":
-        node.Normal = setup_norm_vector(node.Normal_Sun, "F", orb, epoch, fixed_vector)
+        node.Normal = setup_norm_vector(node.Normal_Sun, "F", orb, epoch, fixed_vector, fixed_reference_vector)
 
 
 def set_Nodes_Nadir(Nodes, attitude, orb, epoch):
+    """Initialize or reset all node normals using their nadir-frame definitions."""
     for nod in Nodes:
         nod.Normal = setup_norm_vector(nod.Normal_Nadir, attitude, orb, epoch)
 
-def set_Nodes_Sun(Nodes, attitude, orb, epoch, fixed_vector=None):
+def set_Nodes_Sun(Nodes, attitude, orb, epoch, fixed_vector=None, fixed_reference_vector=None):
+    """Initialize or reset all node normals using their Sun/fixed-frame definitions."""
     for nod in Nodes:
-        nod.Normal = setup_norm_vector(nod.Normal_Sun, attitude, orb, epoch, fixed_vector)
+        nod.Normal = setup_norm_vector(nod.Normal_Sun, attitude, orb, epoch, fixed_vector, fixed_reference_vector)
 
 
-def setup_norm_vector(text, attitude, orb, epoch, fixed_vector=None):
+def setup_norm_vector(text, attitude, orb, epoch, fixed_vector=None, fixed_reference_vector=None):
+    """Parse one orientation string into a unit vector in inertial coordinates."""
 
     text = text.upper()
 
@@ -1125,17 +1386,17 @@ def setup_norm_vector(text, attitude, orb, epoch, fixed_vector=None):
 
     elif attitude == "F":
         if text == "X" or text == "+X":
-            return fixed_xyz_to_gcrs([1,0,0], fixed_vector)
+            return fixed_xyz_to_gcrs([1,0,0], fixed_vector, fixed_reference_vector)
         elif text == "-X":
-            return fixed_xyz_to_gcrs([-1,0,0], fixed_vector)
+            return fixed_xyz_to_gcrs([-1,0,0], fixed_vector, fixed_reference_vector)
         elif text == "Y" or text == "+Y":
-            return fixed_xyz_to_gcrs([0,1,0], fixed_vector)
+            return fixed_xyz_to_gcrs([0,1,0], fixed_vector, fixed_reference_vector)
         elif text == "-Y":
-            return fixed_xyz_to_gcrs([0,-1,0], fixed_vector)
+            return fixed_xyz_to_gcrs([0,-1,0], fixed_vector, fixed_reference_vector)
         elif text == "Z" or text == "+Z":
-            return fixed_xyz_to_gcrs([0,0,1], fixed_vector)
+            return fixed_xyz_to_gcrs([0,0,1], fixed_vector, fixed_reference_vector)
         elif text == "-Z":
-            return fixed_xyz_to_gcrs([0,0,-1], fixed_vector)
+            return fixed_xyz_to_gcrs([0,0,-1], fixed_vector, fixed_reference_vector)
         elif text == "I":
             return 0
         else:
@@ -1146,7 +1407,7 @@ def setup_norm_vector(text, attitude, orb, epoch, fixed_vector=None):
                 Z = float(tmp[2])
                 tmp = np.array([X,Y,Z])
                 tmp = tmp/np.linalg.norm(tmp)
-                return fixed_xyz_to_gcrs(tmp, fixed_vector)
+                return fixed_xyz_to_gcrs(tmp, fixed_vector, fixed_reference_vector)
             except Exception as e:
                 print("ERROR: During parsing the norm of one node the string is not correct " + str(text) + " '"+str(attitude)+"'")
                 exit(1)
@@ -1180,6 +1441,7 @@ def setup_norm_vector(text, attitude, orb, epoch, fixed_vector=None):
 
 
 def selectFile():
+    """Open a simple file-picker dialog and return the selected workbook handle."""
 
     root = tk.Tk()
     root.withdraw()
@@ -1190,7 +1452,11 @@ def selectFile():
 
 
 
+# ---------------------------------------------------------------------------
+# Spreadsheet-driven simulation setup and execution
+# ---------------------------------------------------------------------------
 def main():
+    """Read the workbook, run the simulation loop, and export the results."""
 
 
 
@@ -1246,7 +1512,9 @@ def main():
     SIM_PWR_MAX_DCHG = 0.0
 
 
+    # These state variables evolve while the simulation runs.
     SIM_ROTATION_VECTOR = []
+    FIXED_POINTING_REFERENCE_VECTOR = None
 
 
 
@@ -1280,6 +1548,8 @@ def main():
 
 
 
+    # The workbook is the only user input: all geometry, environment, and
+    # mission settings are read from its sheets.
     FILE_PATH = selectFile()
 
     if not FILE_PATH:
@@ -1617,9 +1887,18 @@ def main():
     index = index + 1
     for nod in Nodes:
         if nod.Name == SIM_NODE_POINTING:
+            try:
+                FIXED_POINTING_REFERENCE_VECTOR = parse_xyz_frame_vector(nod.Normal_Sun)
+            except Exception:
+                print("ERROR: The selected fixed-pointing node has an invalid SUN/FIXED direction definition")
+                exit(1)
             break
     else:
         print("ERROR: The Node name that must point to a fixed point is not present as a node " + str(SIM_NODE_POINTING))
+        exit(1)
+
+    if FIXED_POINTING_REFERENCE_VECTOR is None:
+        print("ERROR: The selected fixed-pointing node cannot be internal or undefined in the SUN/FIXED frame")
         exit(1)
 
     SIM_ATTITUDE_CHANGE_TIME = float(FILE_H.iloc[index].iat[1])
@@ -1778,6 +2057,7 @@ def main():
         "solar_generation_history": [],
         "solar_bus_power_history": [],
         "load_power_history": [],
+        "requested_load_power_history": [],
         "heater_power_history": [],
         "battery_loss_power_history": [],
         "charge_power_history": [],
@@ -2009,7 +2289,7 @@ def main():
     if APPLIED_ATTITUDE == "N":
         set_Nodes_Nadir(Nodes, APPLIED_ATTITUDE, Orb.Orbit, SIM_START_EPOCH)
     elif APPLIED_ATTITUDE == "F":
-        set_Nodes_Sun(Nodes, APPLIED_ATTITUDE, Orb.Orbit, SIM_START_EPOCH, APPLIED_FIXED_VECTOR)
+        set_Nodes_Sun(Nodes, APPLIED_ATTITUDE, Orb.Orbit, SIM_START_EPOCH, APPLIED_FIXED_VECTOR, FIXED_POINTING_REFERENCE_VECTOR)
     else:
         set_Nodes_Sun(Nodes, "S", Orb.Orbit, SIM_START_EPOCH)
 
@@ -2019,6 +2299,8 @@ def main():
 
     SIM_ECLIPSE = 0
 
+    # Main simulation loop: propagate orbit, update attitude, solve thermal and
+    # electrical balance, then record the current state in the histories.
     for step in range(0, SIM_MAX_STEPS+1):
 
         current_time = SIM_START_EPOCH + step*SIM_STEP_SIZE*u.s
@@ -2057,6 +2339,7 @@ def main():
                 current_orbit,
                 current_time,
                 DESIRED_FIXED_VECTOR,
+                FIXED_POINTING_REFERENCE_VECTOR,
             )
 
             if not ATTITUDE_TRANSITION_ACTIVE:
@@ -2103,7 +2386,14 @@ def main():
             if ATTITUDE_TRANSITION_ACTIVE:
                 break
 
-            update_Node_Attitude(nod, APPLIED_ATTITUDE, current_orbit, current_time, APPLIED_FIXED_VECTOR)
+            update_Node_Attitude(
+                nod,
+                APPLIED_ATTITUDE,
+                current_orbit,
+                current_time,
+                APPLIED_FIXED_VECTOR,
+                FIXED_POINTING_REFERENCE_VECTOR,
+            )
 
             if APPLIED_ATTITUDE in ["C", "R"] and step > 0:
                 if APPLIED_ATTITUDE == "C":
@@ -2139,6 +2429,8 @@ def main():
             nod.update_angles(Orb, current_time)
 
 
+        # Apply power/thermal coupling after attitude and geometry have been
+        # refreshed for the current propagated orbit state.
         #  ORBIT PROPAGATION AND CALCULATIONS OF THE SIMULATION
 
         set_heater_power_for_step(Nodes, Orb, POWER_STATE)
@@ -2161,6 +2453,10 @@ def main():
                 POWER_STATE,
                 SIM_STEP_SIZE,
             )
+
+        if not SIM_THERMAL_SIM:
+            for nod in Nodes:
+                nod.updateTemp(nod.Temp)
 
 
 
@@ -2203,6 +2499,9 @@ def main():
         POWER_STATE,
     )
     print("CSV data saved in " + output_dir)
+
+    print_temperature_statistics(Nodes)
+    print_power_summary(Nodes, ORBIT_ARRAY, POWER_STATE)
 
 
 
